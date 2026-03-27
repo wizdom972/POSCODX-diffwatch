@@ -1,31 +1,45 @@
 """
-GitHub Webhook 수신 서버
-
-GitHub push 이벤트를 받아 자동으로 코드 영향도 분석을 실행합니다.
+GitHub Webhook 수신 서버 + 관리자 대시보드
 
 실행 방법:
     uv run fastapi dev webhook_server.py --port 8001
+
+접속:
+    대시보드 → http://localhost:8001
 """
 
+import asyncio
 import hashlib
 import hmac
+import json
 import os
-import asyncio
+import re
+import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 load_dotenv(override=True)
 
-app = FastAPI()
+BASE_DIR = Path(__file__).parent
+CHANGES_INDEX = BASE_DIR / "rag" / "changes_index.json"
+NOTIFICATIONS_LOG = BASE_DIR / "notifications_log.md"
+FRONTEND_DIR = BASE_DIR / "frontend"
 
 WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 
+app = FastAPI(title="diffwatch")
+app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+
+# ─── 유틸 ──────────────────────────────────────────────────────
 
 def verify_signature(payload: bytes, signature: str) -> bool:
-    """GitHub 요청 서명을 검증합니다."""
     if not WEBHOOK_SECRET:
-        return True  # Secret 미설정 시 검증 생략 (개발 환경)
+        return True
     expected = "sha256=" + hmac.new(
         WEBHOOK_SECRET.encode(), payload, hashlib.sha256
     ).hexdigest()
@@ -33,11 +47,8 @@ def verify_signature(payload: bytes, signature: str) -> bool:
 
 
 async def run_analysis(commit_hash: str, commit_message: str, author: str):
-    """에이전트를 호출해 커밋 영향도를 분석합니다."""
     from agent import create_base_agent
-
     print(f"\n[Webhook] 분석 시작: {commit_hash[:8]} — {commit_message}")
-
     agent = await create_base_agent()
     prompt = (
         f"다음 커밋의 영향도를 분석하고 담당자에게 알림을 보내줘.\n"
@@ -45,32 +56,112 @@ async def run_analysis(commit_hash: str, commit_message: str, author: str):
         f"커밋 메시지: {commit_message}\n"
         f"작성자: {author}"
     )
-    result = await agent.ainvoke(
+    await agent.ainvoke(
         {"messages": [{"role": "user", "content": prompt}]},
         config={"configurable": {"thread_id": commit_hash}},
     )
     print(f"[Webhook] 분석 완료: {commit_hash[:8]}")
-    return result
 
 
-@app.get("/")
-async def health():
-    return {"status": "ok", "message": "Webhook 서버 정상 동작 중"}
+# ─── 페이지 ────────────────────────────────────────────────────
 
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
+
+
+# ─── API: 통계 / 커밋 / 알림 ───────────────────────────────────
+
+@app.get("/api/stats")
+async def get_stats():
+    changes = json.loads(CHANGES_INDEX.read_text(encoding="utf-8")) if CHANGES_INDEX.exists() else []
+    notifs = await get_notifications()
+    return {
+        "total_commits": len(changes),
+        "high_impact": sum(1 for c in changes if c.get("impact_level") == "높음"),
+        "mid_impact": sum(1 for c in changes if c.get("impact_level") == "중간"),
+        "low_impact": sum(1 for c in changes if c.get("impact_level") == "낮음"),
+        "total_notifications": len(notifs),
+    }
+
+
+@app.get("/api/changes")
+async def get_changes():
+    if not CHANGES_INDEX.exists():
+        return []
+    return list(reversed(json.loads(CHANGES_INDEX.read_text(encoding="utf-8"))))
+
+
+@app.get("/api/notifications")
+async def get_notifications():
+    if not NOTIFICATIONS_LOG.exists():
+        return []
+    text = NOTIFICATIONS_LOG.read_text(encoding="utf-8")
+    results = []
+    for block in [b.strip() for b in text.split("---") if b.strip()]:
+        if "전송 시각" not in block:
+            continue
+        item = {}
+        for line in block.splitlines():
+            line = line.strip()
+            if line.startswith("**전송 시각:**"):
+                item["sent_at"] = line.replace("**전송 시각:**", "").strip()
+            elif line.startswith("**수신자:**"):
+                item["recipients"] = line.replace("**수신자:**", "").strip()
+            elif line.startswith("**제목:**"):
+                item["subject"] = line.replace("**제목:**", "").strip()
+        if item:
+            match = re.search(r"\*\*제목:\*\*[^\n]*\n([\s\S]+)", block)
+            item["body"] = match.group(1).strip() if match else ""
+            results.append(item)
+    return list(reversed(results))
+
+
+# ─── API: 챗봇 ─────────────────────────────────────────────────
+
+@app.post("/api/chat")
+async def chat(request: Request):
+    """에이전트와 대화합니다. SSE 스트림으로 응답을 반환합니다."""
+    body = await request.json()
+    message = body.get("message", "").strip()
+    session_id = body.get("session_id", str(uuid.uuid4()))
+
+    if not message:
+        raise HTTPException(status_code=400, detail="메시지를 입력하세요.")
+
+    async def stream():
+        from agent import create_base_agent
+        agent = await create_base_agent()
+
+        async for event in agent.astream_events(
+            {"messages": [{"role": "user", "content": message}]},
+            config={"configurable": {"thread_id": f"chat-{session_id}"}},
+            version="v2",
+        ):
+            kind = event.get("event")
+            # AI 메시지 토큰만 스트리밍
+            if kind == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                if chunk and hasattr(chunk, "content") and chunk.content:
+                    token = chunk.content
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+
+        yield f"data: {json.dumps({'done': True})}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+# ─── Webhook ───────────────────────────────────────────────────
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     payload = await request.body()
-
-    # 서명 검증
     signature = request.headers.get("X-Hub-Signature-256", "")
     if not verify_signature(payload, signature):
         raise HTTPException(status_code=403, detail="서명 검증 실패")
 
-    # push 이벤트만 처리
     event = request.headers.get("X-GitHub-Event", "")
     if event != "push":
-        print(f"[Webhook] 무시된 이벤트: {event}")
         return {"status": "ignored", "event": event}
 
     data = await request.json()
@@ -83,8 +174,5 @@ async def handle_webhook(request: Request):
         return {"status": "no commit"}
 
     print(f"[Webhook] Push 감지: {commit_hash[:8]} by {author} — {commit_message}")
-
-    # 분석은 백그라운드에서 실행 (GitHub에 즉시 200 응답 반환)
     asyncio.create_task(run_analysis(commit_hash, commit_message, author))
-
     return {"status": "ok", "commit": commit_hash[:8]}
