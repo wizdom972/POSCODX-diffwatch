@@ -131,20 +131,28 @@ async def chat(request: Request):
 
     async def stream():
         from agent import create_base_agent
+        from langgraph.errors import GraphRecursionError
         agent = await create_base_agent()
 
-        async for event in agent.astream_events(
-            {"messages": [{"role": "user", "content": message}]},
-            config={"configurable": {"thread_id": f"chat-{session_id}"}},
-            version="v2",
-        ):
-            kind = event.get("event")
-            # AI 메시지 토큰만 스트리밍
-            if kind == "on_chat_model_stream":
-                chunk = event.get("data", {}).get("chunk")
-                if chunk and hasattr(chunk, "content") and chunk.content:
-                    token = chunk.content
-                    yield f"data: {json.dumps({'token': token})}\n\n"
+        try:
+            async for event in agent.astream_events(
+                {"messages": [{"role": "user", "content": message}]},
+                config={
+                    "configurable": {"thread_id": f"chat-{session_id}"},
+                    "recursion_limit": 50,
+                },
+                version="v2",
+            ):
+                kind = event.get("event")
+                if kind == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        yield f"data: {json.dumps({'token': chunk.content})}\n\n"
+
+        except GraphRecursionError:
+            yield f"data: {json.dumps({'token': '⚠️ 응답 생성 중 반복 한계에 도달했습니다. 질문을 더 구체적으로 입력해주세요.'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'token': f'⚠️ 오류가 발생했습니다: {str(e)}'})}\n\n"
 
         yield f"data: {json.dumps({'done': True})}\n\n"
 
