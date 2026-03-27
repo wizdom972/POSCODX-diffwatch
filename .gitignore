@@ -1,2 +1,32 @@
+# 환경 변수 (API 키 포함 — 절대 커밋하지 마세요)
 .env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
 .venv/
+*.egg-info/
+dist/
+build/
+
+# 자동 생성 데이터 파일
+rag/changes_index.json
+notifications_log.md
+
+# Chainlit
+.chainlit/
+chainlit.md
+
+# Claude Code 로컬 설정
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

@@ -97,6 +97,24 @@ def retrieve(query: str):
     return text, results
 
 
+def add_documents_to_store(documents: list) -> None:
+    """벡터 스토어에 문서를 동적으로 추가합니다.
+    현재 세션 내에서 즉시 검색 가능하도록 인메모리 스토어에 반영합니다.
+
+    Args:
+        documents: 추가할 Document 객체 목록
+    """
+    vs = _build_vector_store()
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+    splits = splitter.split_documents(documents)
+    vs.add_documents(splits)
+    print(f"[RAG] 문서 {len(documents)}개 추가 → {len(splits)}개 청크")
+
+
 def get_rag_tools() -> list:
     """RAG 검색 도구 리스트를 반환합니다."""
     # 벡터 스토어를 미리 구축 (첫 호출 시)

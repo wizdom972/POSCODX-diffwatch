@@ -15,4 +15,5 @@ dependencies = [
     "python-dotenv>=1.1.0",
     "numpy>=2.0.0",
     "pypdf>=4.0.0",
+    "fastapi[stadard,standard]>=0.135.2",
 ]
